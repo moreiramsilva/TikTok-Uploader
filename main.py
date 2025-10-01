@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""TikTok Uploader — esqueleto mínimo.
+"""TikTok Uploader — versão com adaptador, logging em arquivo e watchmode.
 
-Este script escaneia `videos_para_upload/` em busca de arquivos `.mp4`, busca o `.txt` correspondente
-para legenda e simula o upload para o TikTok.
-
-Substitua a função `mock_upload` por uma implementação real de upload usando a API/biblioteca de sua escolha.
+Use --watch para observar a pasta `videos_para_upload/` e enviar novos arquivos automaticamente.
 """
 
 import os
 import shutil
 import time
 import logging
+import argparse
 from pathlib import Path
 
 try:
@@ -18,38 +16,29 @@ try:
 except Exception:
     load_dotenv = None
 
-
-def mock_upload(video_path: Path, caption: str, sessionid: str):
-    """Simula um upload. Retorna (success: bool, remote_id: str|None)."""
-    logging.info("Simulando upload: %s (caption len=%d)", video_path.name, len(caption))
-    time.sleep(0.5)
-    return True, "mock_video_id_123"
+from upload.provider import MockUploader, BaseUploader
 
 
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-    root = Path(__file__).parent
-    upload_dir = root / "videos_para_upload"
-    published_dir = root / "videos_publicados"
-    upload_dir.mkdir(exist_ok=True)
-    published_dir.mkdir(exist_ok=True)
+def setup_logging(root: Path):
+    logs = root / "logs"
+    logs.mkdir(exist_ok=True)
+    log_file = logs / "uploader.log"
+    handler = logging.handlers.RotatingFileHandler(str(log_file), maxBytes=2_000_000, backupCount=5)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+    handler.setFormatter(formatter)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(handler)
+    # also console handler
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    root_logger.addHandler(ch)
 
-    if load_dotenv:
-        # Carrega variáveis do arquivo .env na raiz do projeto, se existir
-        load_dotenv(root / ".env")
 
-    sessionid = os.getenv("TIKTOK_SESSION_ID")
-    if not sessionid:
-        logging.warning("TIKTOK_SESSION_ID não definido. Rodando em modo dry-run (sem enviar realmente).")
-
-    videos = sorted(upload_dir.glob("*.mp4"))
-    if not videos:
-        logging.info("Nenhum vídeo encontrado em %s", upload_dir)
-        return
-
-    summary = {"success": 0, "failed": 0}
-
-    for v in videos:
+def pair_videos(upload_dir: Path):
+    """Retorna lista de (video_path, caption) a serem enviados."""
+    pairs = []
+    for v in sorted(upload_dir.glob("*.mp4")):
         txt = v.with_suffix(".txt")
         caption = ""
         if txt.exists():
@@ -58,24 +47,91 @@ def main():
             except Exception as e:
                 logging.warning("Erro ao ler %s: %s", txt.name, e)
         else:
-            logging.warning("Arquivo de legenda não encontrado para %s; legenda vazia será usada.", v.name)
+            logging.warning("Legenda não encontrada para %s; legenda vazia será usada.", v.name)
+        pairs.append((v, caption))
+    return pairs
 
-        ok, remote_id = mock_upload(v, caption, sessionid)
+
+def process_all(uploader: BaseUploader, upload_dir: Path, published_dir: Path):
+    summary = {"success": 0, "failed": 0}
+    for v, caption in pair_videos(upload_dir):
+        ok, remote_id = uploader.upload(v, caption)
         if ok:
             try:
                 shutil.move(str(v), published_dir / v.name)
+                txt = v.with_suffix(".txt")
                 if txt.exists():
                     shutil.move(str(txt), published_dir / txt.name)
-                logging.info("Upload simulado com sucesso e arquivos movidos: %s", v.name)
+                logging.info("Upload bem-sucedido: %s -> %s", v.name, remote_id)
                 summary["success"] += 1
             except Exception as e:
-                logging.error("Erro ao mover arquivos de %s: %s", v.name, e)
+                logging.exception("Erro ao mover arquivos de %s: %s", v.name, e)
                 summary["failed"] += 1
         else:
-            logging.error("Falha no upload simulado para %s", v.name)
+            logging.error("Falha no upload para %s", v.name)
             summary["failed"] += 1
-
     logging.info("Resumo: sucesso=%d falha=%d", summary["success"], summary["failed"])
+
+
+def watch_and_process(uploader: BaseUploader, upload_dir: Path, published_dir: Path):
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+    except Exception:
+        logging.error("watchdog não instalado; instale com pip install watchdog")
+        return
+
+    class Handler(FileSystemEventHandler):
+        def on_created(self, event):
+            p = Path(event.src_path)
+            if p.suffix.lower() == ".mp4":
+                logging.info("Novo arquivo detectado: %s", p.name)
+                time.sleep(0.5)  # esperar completar escrita
+                process_all(uploader, upload_dir, published_dir)
+
+    observer = Observer()
+    observer.schedule(Handler(), str(upload_dir), recursive=False)
+    observer.start()
+    logging.info("Watchmode ativo em %s (pressione Ctrl+C para sair)", upload_dir)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logging.info("Encerrando watchmode...")
+        observer.stop()
+    observer.join()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--watch", action="store_true", help="Observa a pasta e envia novos vídeos automaticamente")
+    parser.add_argument("--provider", choices=["mock", "tiktok"], default="mock", help="Escolhe o provider de upload")
+    parser.add_argument("--dry-run", action="store_true", help="Executa em modo dry-run (não faz uploads reais)")
+    args = parser.parse_args()
+
+    root = Path(__file__).parent
+    upload_dir = root / "videos_para_upload"
+    published_dir = root / "videos_publicados"
+    upload_dir.mkdir(exist_ok=True)
+    published_dir.mkdir(exist_ok=True)
+
+    setup_logging(root)
+
+    if load_dotenv:
+        load_dotenv(root / ".env")
+
+    # Escolhe provider
+    if args.provider == "mock":
+        uploader = MockUploader()
+    else:
+        # import local para evitar erro se requests não estiver configurado
+        from upload.tiktok_uploader import TikTokUploader
+        uploader = TikTokUploader(sessionid=os.getenv("TIKTOK_SESSION_ID"), dry_run=args.dry_run)
+
+    if args.watch:
+        watch_and_process(uploader, upload_dir, published_dir)
+    else:
+        process_all(uploader, upload_dir, published_dir)
 
 
 if __name__ == "__main__":
